@@ -1,4 +1,4 @@
-import { User, Cipher, Folder, Attachment, Device, Invite, AuditLog, Send, TrustedDeviceTokenSummary, RefreshTokenRecord } from '../types';
+import { User, Cipher, Folder, Attachment, Device, Invite, AuditLog, Send, TrustedDeviceTokenSummary, RefreshTokenRecord, CustomEquivalentDomain } from '../types';
 import { LIMITS } from '../config/limits';
 import { ensureStorageSchema } from './storage-schema';
 import {
@@ -18,12 +18,17 @@ import {
   saveUser as saveStoredUser,
 } from './storage-user-repo';
 import {
+  type AuditLogListOptions,
   createAuditLog as createStoredAuditLog,
+  clearAuditLogs as clearStoredAuditLogs,
   createInvite as createStoredInvite,
   deleteAllInvites as deleteStoredInvites,
   getInvite as findStoredInvite,
+  listAuditLogs as listStoredAuditLogs,
   listInvites as listStoredInvites,
   markInviteUsed as markStoredInviteUsed,
+  pruneAuditLogs as pruneStoredAuditLogs,
+  pruneAuditLogsToMax as pruneStoredAuditLogsToMax,
   revokeInvite as revokeStoredInvite,
 } from './storage-admin-repo';
 import {
@@ -96,6 +101,7 @@ import {
   upsertDevice as saveStoredDevice,
   updateDeviceName as updateStoredDeviceName,
   updateDeviceKeys as updateStoredDeviceKeys,
+  updateTrustedTwoFactorTokensExpiryByDevice as updateStoredTrustedTokensExpiryByDevice,
 } from './storage-device-repo';
 import {
   ensureUsedAttachmentDownloadTokenTable as ensureStoredAttachmentTokenTable,
@@ -105,10 +111,18 @@ import {
   getRevisionDate as getStoredRevisionDate,
   updateRevisionDate as updateStoredRevisionDate,
 } from './storage-revision-repo';
+import {
+  getUserDomainSettings as getStoredUserDomainSettings,
+  saveUserDomainSettings as saveStoredUserDomainSettings,
+} from './storage-domain-rules-repo';
 
 const TWO_FACTOR_REMEMBER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const STORAGE_SCHEMA_VERSION_KEY = 'schema.version';
-const STORAGE_SCHEMA_VERSION = '2026-04-28';
+// IMPORTANT:
+// Bump this whenever src/services/storage-schema.ts or migrations/0001_init.sql
+// changes. Existing D1 installs only rerun ensureStorageSchema() when this value
+// differs from config.schema.version.
+const STORAGE_SCHEMA_VERSION = '2026-05-14-lightweight-audit-logs';
 
 // D1-backed storage.
 // Contract:
@@ -268,6 +282,45 @@ export class StorageService {
 
   async createAuditLog(log: AuditLog): Promise<void> {
     await createStoredAuditLog(this.db, log);
+  }
+
+  async listAuditLogs(options: AuditLogListOptions): Promise<{ logs: AuditLog[]; total: number; hasMore: boolean }> {
+    return listStoredAuditLogs(this.db, options);
+  }
+
+  async pruneAuditLogs(beforeIso: string): Promise<number> {
+    return pruneStoredAuditLogs(this.db, beforeIso);
+  }
+
+  async pruneAuditLogsToMax(maxEntries: number): Promise<number> {
+    return pruneStoredAuditLogsToMax(this.db, maxEntries);
+  }
+
+  async clearAuditLogs(): Promise<number> {
+    return clearStoredAuditLogs(this.db);
+  }
+
+  // --- Domain rules ---
+
+  async getUserDomainSettings(userId: string) {
+    return getStoredUserDomainSettings(this.db, userId);
+  }
+
+  async saveUserDomainSettings(
+    userId: string,
+    equivalentDomains: string[][],
+    customEquivalentDomains: CustomEquivalentDomain[],
+    excludedGlobalEquivalentDomains: number[]
+  ): Promise<void> {
+    await saveStoredUserDomainSettings(
+      this.db,
+      userId,
+      equivalentDomains,
+      customEquivalentDomains,
+      excludedGlobalEquivalentDomains,
+      new Date().toISOString()
+    );
+    await this.updateRevisionDate(userId);
   }
 
   // --- Ciphers ---
@@ -432,7 +485,6 @@ export class StorageService {
       this.db,
       this.refreshTokenKey.bind(this),
       this.maybeCleanupExpiredRefreshTokens.bind(this),
-      this.saveRefreshToken.bind(this),
       this.deleteRefreshToken.bind(this),
       token
     );
@@ -581,6 +633,10 @@ export class StorageService {
 
   async deleteTrustedTwoFactorTokensByUserId(userId: string): Promise<number> {
     return deleteStoredTrustedTokensByUserId(this.db, userId);
+  }
+
+  async updateTrustedTwoFactorTokensExpiryByDevice(userId: string, deviceIdentifier: string, expiresAtMs: number): Promise<number> {
+    return updateStoredTrustedTokensExpiryByDevice(this.db, userId, deviceIdentifier, expiresAtMs);
   }
 
   // --- Trusted 2FA remember tokens (device-bound) ---

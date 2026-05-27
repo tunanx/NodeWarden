@@ -40,6 +40,7 @@ import {
   uploadBackupArchive,
 } from '../services/backup-uploader';
 import { StorageService } from '../services/storage';
+import { auditRequestMetadata, writeAuditEvent } from '../services/audit-events';
 import { getBlobObject } from '../services/blob-store';
 import { notifyUserBackupProgress, notifyUserBackupRestoreProgress } from '../durable/notifications-hub';
 
@@ -53,16 +54,20 @@ async function writeAuditLog(
   action: string,
   targetType: string | null,
   targetId: string | null,
-  metadata: Record<string, unknown> | null
+  metadata: Record<string, unknown> | null,
+  request?: Request
 ): Promise<void> {
-  await storage.createAuditLog({
-    id: generateUUID(),
+  await writeAuditEvent(storage, {
     actorUserId,
     action,
     targetType,
     targetId,
-    metadata: metadata ? JSON.stringify(metadata) : null,
-    createdAt: new Date().toISOString(),
+    category: 'data',
+    level: action.endsWith('.failed') ? 'error' : 'info',
+    metadata: {
+      ...(metadata || {}),
+      ...(request ? auditRequestMetadata(request) : {}),
+    },
   });
 }
 
@@ -85,6 +90,10 @@ const BACKUP_RUNNER_LOCK_KEY = 'backup.runner.lock.v1';
 const BACKUP_RUNNER_LEASE_MS = 10 * 60 * 1000;
 const BACKUP_RUNNER_HEARTBEAT_MS = 30 * 1000;
 
+// CONTRACT:
+// The runner lock is a config-row lease, not a queue. It only prevents two
+// backup/restore jobs from overlapping. Manual runs return conflict when the
+// lease is held; scheduled runs skip quietly. Never export this row in backups.
 interface BackupRunnerLease {
   token: string;
   touch: () => Promise<void>;
@@ -263,7 +272,8 @@ async function executeConfiguredBackup(
     done?: boolean;
     ok?: boolean;
     error?: string | null;
-  }) => Promise<void>) | null
+  }) => Promise<void>) | null,
+  auditMetadata?: Record<string, unknown> | null
 ): Promise<{ fileName: string; fileSize: number; remotePath: string; provider: string }> {
   const maxArchiveUploadAttempts = 3;
   const touchLease = async () => {
@@ -419,6 +429,7 @@ async function executeConfiguredBackup(
       uploadVerificationAttempts: maxArchiveUploadAttempts,
       prunedFileCount,
       pruneError: pruneErrorMessage,
+      ...(auditMetadata || {}),
     });
 
     await progress?.({
@@ -447,6 +458,7 @@ async function executeConfiguredBackup(
     await writeAuditLog(storage, actorUserId, `admin.backup.remote.${trigger}.failed`, 'backup', null, {
       ...getBackupDestinationSummary(destination),
       error: destination.runtime.lastErrorMessage,
+      ...(auditMetadata || {}),
     });
     await progress?.({
       operation: 'backup-remote-run',
@@ -509,7 +521,7 @@ async function runImportAndAudit(
     skippedReason: imported.result.skipped.reason,
     replaceExisting,
     ...metadata,
-  });
+  }, request);
   return imported;
 }
 
@@ -582,7 +594,7 @@ export async function handleUpdateAdminBackupSettings(request: Request, env: Env
   await writeAuditLog(storage, actorUser.id, 'admin.backup.settings.update', 'backup', null, {
     destinationCount: next.destinations.length,
     scheduledDestinationCount: next.destinations.filter((destination) => destination.schedule.enabled).length,
-  });
+  }, request);
   return jsonResponse(next);
 }
 
@@ -632,7 +644,7 @@ export async function handleRepairAdminBackupSettings(request: Request, env: Env
   await writeAuditLog(storage, actorUser.id, 'admin.backup.settings.repair', 'backup', null, {
     destinationCount: next.destinations.length,
     scheduledDestinationCount: next.destinations.filter((destination) => destination.schedule.enabled).length,
-  });
+  }, request);
   return jsonResponse(next);
 }
 
@@ -671,7 +683,8 @@ export async function handleRunAdminConfiguredBackup(request: Request, env: Env,
         'manual',
         body?.destinationId || null,
         keepAlive,
-        progress
+        progress,
+        auditRequestMetadata(request)
       );
       const settings = await loadBackupSettings(storage, env, 'UTC');
       return { result, settings };
@@ -773,7 +786,7 @@ export async function handleDeleteAdminRemoteBackup(request: Request, env: Env, 
     await writeAuditLog(storage, actorUser.id, 'admin.backup.remote.delete', 'backup', null, {
       ...getBackupDestinationSummary(destination),
       remotePath: path,
-    });
+    }, request);
     return jsonResponse({ object: 'backup-remote-delete', deleted: true, path });
   } catch (error) {
     return errorResponse(error instanceof Error ? error.message : 'Remote backup delete failed', 409);
@@ -856,7 +869,7 @@ export async function handleRestoreAdminRemoteBackup(request: Request, env: Env,
         bytes: remoteFile.bytes.byteLength,
         trigger: 'remote',
         checksumMismatchAccepted: !checksumOk,
-      });
+      }, request);
       return result;
     })();
     return jsonResponse(imported.result);
@@ -933,7 +946,7 @@ export async function handleAdminExportBackup(request: Request, env: Env, actorU
     attachments: archive.manifest.tableCounts.attachments,
     compressedBytes: archive.bytes.byteLength,
     includesAttachments: archive.manifest.includes.attachments,
-  });
+  }, request);
 
   return new Response(archive.bytes, {
     status: 200,

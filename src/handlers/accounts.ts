@@ -2,6 +2,7 @@ import { Env, User, ProfileResponse, DEFAULT_DEV_SECRET } from '../types';
 import { StorageService } from '../services/storage';
 import { AuthService } from '../services/auth';
 import { RateLimitService, getClientIdentifier } from '../services/ratelimit';
+import { auditRequestMetadata, writeAuditEvent, safeWriteAuditEvent } from '../services/audit-events';
 import { jsonResponse, errorResponse } from '../utils/response';
 import { generateUUID } from '../utils/uuid';
 import { LIMITS } from '../config/limits';
@@ -9,6 +10,11 @@ import { isTotpEnabled, verifyTotpToken } from '../utils/totp';
 import { createRecoveryCode, recoveryCodeEquals } from '../utils/recovery-code';
 import { buildAccountKeys } from '../utils/user-decryption';
 
+// CONTRACT:
+// users.master_password_hash is server-side login verification only. It does
+// not decrypt vault data. Password changes must keep encrypted user key material,
+// securityStamp, refresh-token invalidation, and client compatibility together.
+// Password hints are non-secret reminders; never treat them as recovery secrets.
 function looksLikeEncString(value: string): boolean {
   if (!value) return false;
   const firstDot = value.indexOf('.');
@@ -222,14 +228,14 @@ export async function handleRegister(request: Request, env: Env): Promise<Respon
       return errorResponse('Registration is temporarily unavailable, retry once', 409);
     }
     await storage.setRegistered();
-    await storage.createAuditLog({
-      id: generateUUID(),
+    await writeAuditEvent(storage, {
       actorUserId: user.id,
       action: 'user.register.first_admin',
       targetType: 'user',
       targetId: user.id,
-      metadata: JSON.stringify({ email: user.email }),
-      createdAt: now,
+      category: 'security',
+      level: 'security',
+      metadata: { email: user.email, ...auditRequestMetadata(request) },
     });
     return jsonResponse({ success: true, role: user.role }, 200);
   }
@@ -254,14 +260,14 @@ export async function handleRegister(request: Request, env: Env): Promise<Respon
     return errorResponse('Invite code is invalid or expired', 403);
   }
 
-  await storage.createAuditLog({
-    id: generateUUID(),
+  await writeAuditEvent(storage, {
     actorUserId: user.id,
     action: 'user.register.invite',
     targetType: 'user',
     targetId: user.id,
-    metadata: JSON.stringify({ email: user.email, inviteCode }),
-    createdAt: now,
+    category: 'security',
+    level: 'info',
+    metadata: { email: user.email, inviteCode, ...auditRequestMetadata(request) },
   });
 
   return jsonResponse({ success: true, role: user.role }, 200);
@@ -373,6 +379,18 @@ export async function handleUpdateProfile(request: Request, env: Env, userId: st
   user.masterPasswordHint = masterPasswordHint;
   user.updatedAt = new Date().toISOString();
   await storage.saveUser(user);
+  await writeAuditEvent(storage, {
+    actorUserId: user.id,
+    action: 'account.profile.update',
+    category: 'security',
+    level: 'info',
+    targetType: 'user',
+    targetId: user.id,
+    metadata: {
+      updatedMasterPasswordHint: true,
+      ...auditRequestMetadata(request),
+    },
+  });
 
   return jsonResponse(toProfile(user, env));
 }
@@ -407,6 +425,18 @@ export async function handleSetVerifyDevices(request: Request, env: Env, userId:
   user.verifyDevices = body.verifyDevices;
   user.updatedAt = new Date().toISOString();
   await storage.saveUser(user);
+  await writeAuditEvent(storage, {
+    actorUserId: user.id,
+    action: 'account.verify_devices.update',
+    category: 'security',
+    level: 'security',
+    targetType: 'user',
+    targetId: user.id,
+    metadata: {
+      verifyDevices: user.verifyDevices,
+      ...auditRequestMetadata(request),
+    },
+  });
 
   return new Response(null, { status: 200 });
 }
@@ -456,6 +486,20 @@ export async function handleSetKeys(request: Request, env: Env, userId: string):
   user.updatedAt = new Date().toISOString();
 
   await storage.saveUser(user);
+  await writeAuditEvent(storage, {
+    actorUserId: user.id,
+    action: 'account.keys.update',
+    category: 'security',
+    level: 'security',
+    targetType: 'user',
+    targetId: user.id,
+    metadata: {
+      updatedKey: !!body.key,
+      updatedPrivateKey: !!body.encryptedPrivateKey,
+      updatedPublicKey: !!body.publicKey,
+      ...auditRequestMetadata(request),
+    },
+  });
 
   return handleGetProfile(request, env, userId);
 }
@@ -521,14 +565,15 @@ export async function handleChangePassword(request: Request, env: Env, userId: s
   user.updatedAt = new Date().toISOString();
   await storage.saveUser(user);
   await storage.deleteRefreshTokensByUserId(user.id);
-  await storage.createAuditLog({
-    id: generateUUID(),
+  AuthService.invalidateUserCache(user.id);
+  await writeAuditEvent(storage, {
     actorUserId: user.id,
     action: 'user.password.change',
     targetType: 'user',
     targetId: user.id,
-    metadata: JSON.stringify({ email: user.email }),
-    createdAt: user.updatedAt,
+    category: 'security',
+    level: 'security',
+    metadata: { email: user.email, ...auditRequestMetadata(request) },
   });
 
   return new Response(null, { status: 200 });
@@ -582,6 +627,16 @@ export async function handleSetTotpStatus(request: Request, env: Env, userId: st
     user.updatedAt = new Date().toISOString();
     await storage.saveUser(user);
     await storage.deleteRefreshTokensByUserId(user.id);
+    AuthService.invalidateUserCache(user.id);
+    await writeAuditEvent(storage, {
+      actorUserId: user.id,
+      action: 'account.totp.enable',
+      category: 'security',
+      level: 'security',
+      targetType: 'user',
+      targetId: user.id,
+      metadata: auditRequestMetadata(request),
+    });
     return jsonResponse({ enabled: true, recoveryCode: user.totpRecoveryCode, object: 'twoFactor' });
   }
 
@@ -596,6 +651,16 @@ export async function handleSetTotpStatus(request: Request, env: Env, userId: st
     user.updatedAt = new Date().toISOString();
     await storage.saveUser(user);
     await storage.deleteRefreshTokensByUserId(user.id);
+    AuthService.invalidateUserCache(user.id);
+    await writeAuditEvent(storage, {
+      actorUserId: user.id,
+      action: 'account.totp.disable',
+      category: 'security',
+      level: 'security',
+      targetType: 'user',
+      targetId: user.id,
+      metadata: auditRequestMetadata(request),
+    });
     return jsonResponse({ enabled: false, object: 'twoFactor' });
   }
 
@@ -666,7 +731,7 @@ export async function handleRecoverTwoFactor(request: Request, env: Env): Promis
   if (!clientIdentifier) {
     return errorResponse('Client IP is required', 403);
   }
-  const recoverLimitKey = `${clientIdentifier}:recover-2fa:${email || 'unknown'}`;
+  const recoverLimitKey = `${clientIdentifier}:recover-2fa`;
 
   const recoverAttemptCheck = await rateLimit.checkLoginAttempt(recoverLimitKey);
   if (!recoverAttemptCheck.allowed) {
@@ -703,7 +768,17 @@ export async function handleRecoverTwoFactor(request: Request, env: Env): Promis
   user.updatedAt = new Date().toISOString();
   await storage.saveUser(user);
   await storage.deleteRefreshTokensByUserId(user.id);
+  AuthService.invalidateUserCache(user.id);
   await rateLimit.clearLoginAttempts(recoverLimitKey);
+  await safeWriteAuditEvent(env, {
+    actorUserId: user.id,
+    action: 'account.totp.recover',
+    category: 'security',
+    level: 'security',
+    targetType: 'user',
+    targetId: user.id,
+    metadata: auditRequestMetadata(request),
+  });
 
   return jsonResponse({
     success: true,
@@ -796,6 +871,16 @@ async function apiKey(request: Request, env: Env, userId: string, rotate: boolea
     }
     user.updatedAt = new Date().toISOString();
     await storage.saveUser(user);
+    AuthService.invalidateUserCache(user.id);
+    await writeAuditEvent(storage, {
+      actorUserId: user.id,
+      action: rotate ? 'account.api_key.rotate' : 'account.api_key.create',
+      category: 'security',
+      level: rotate ? 'security' : 'info',
+      targetType: 'user',
+      targetId: user.id,
+      metadata: auditRequestMetadata(request),
+    });
   }
 
   return jsonResponse({

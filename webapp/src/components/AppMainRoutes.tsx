@@ -1,21 +1,24 @@
 import { lazy, Suspense } from 'preact/compat';
 import { useEffect } from 'preact/hooks';
 import { Link, Route, Switch } from 'wouter';
-import { ArrowUpDown, Cloud, LogOut, Settings as SettingsIcon, Shield, ShieldUser } from 'lucide-preact';
+import { ArrowUpDown, Cloud, FileClock, Globe2, LogOut, Settings as SettingsIcon, Shield, ShieldUser } from 'lucide-preact';
 import type { ImportAttachmentFile, ImportResultSummary } from '@/components/ImportPage';
 import LoadingState from '@/components/LoadingState';
 import type { AdminBackupImportResponse, AdminBackupRunResponse, AdminBackupSettings, RemoteBackupBrowserResponse } from '@/lib/api/backup';
+import type { AuditLogFilters } from '@/lib/api/admin';
 import type { CiphersImportPayload } from '@/lib/api/vault';
 import { t } from '@/lib/i18n';
-import type { AdminInvite, AdminUser, AuthorizedDevice, Cipher, Folder as VaultFolder, Profile, Send, SendDraft, SessionState, VaultDraft } from '@/lib/types';
+import type { AdminInvite, AdminUser, AuditLogListResult, AuditLogSettings, AuthorizedDevice, Cipher, CustomEquivalentDomain, DomainRules, Folder as VaultFolder, Profile, Send, SendDraft, SessionState, VaultDraft } from '@/lib/types';
 import type { ExportRequest } from '@/lib/export-formats';
 
 const VaultPage = lazy(() => import('@/components/VaultPage'));
 const SendsPage = lazy(() => import('@/components/SendsPage'));
 const TotpCodesPage = lazy(() => import('@/components/TotpCodesPage'));
 const SettingsPage = lazy(() => import('@/components/SettingsPage'));
+const DomainRulesPage = lazy(() => import('@/components/DomainRulesPage'));
 const SecurityDevicesPage = lazy(() => import('@/components/SecurityDevicesPage'));
 const AdminPage = lazy(() => import('@/components/AdminPage'));
+const LogCenterPage = lazy(() => import('@/components/LogCenterPage'));
 const BackupCenterPage = lazy(() => import('@/components/BackupCenterPage'));
 const ImportPage = lazy(() => import('@/components/ImportPage'));
 
@@ -56,6 +59,9 @@ export interface AppMainRoutesProps {
   authorizedDevices: AuthorizedDevice[];
   authorizedDevicesLoading: boolean;
   authorizedDevicesError: string;
+  domainRules: DomainRules | null;
+  domainRulesLoading: boolean;
+  domainRulesError: string;
   onNavigate: (path: string) => void;
   onLogout: () => void;
   onNotify: (type: 'success' | 'error' | 'warning', text: string) => void;
@@ -75,6 +81,7 @@ export interface AppMainRoutesProps {
   onDeleteVaultItem: (cipher: Cipher) => Promise<void>;
   onArchiveVaultItem: (cipher: Cipher) => Promise<void>;
   onUnarchiveVaultItem: (cipher: Cipher) => Promise<void>;
+  onRestoreVaultItems: (ids: string[]) => Promise<void>;
   onBulkDeleteVaultItems: (ids: string[]) => Promise<void>;
   onBulkPermanentDeleteVaultItems: (ids: string[]) => Promise<void>;
   onBulkRestoreVaultItems: (ids: string[]) => Promise<void>;
@@ -108,8 +115,11 @@ export interface AppMainRoutesProps {
   onLockTimeoutChange: (minutes: 0 | 1 | 5 | 15 | 30) => void;
   onSessionTimeoutActionChange: (action: 'lock' | 'logout') => void;
   onRefreshAuthorizedDevices: () => Promise<void>;
+  onRefreshDomainRules: () => void;
+  onSaveDomainRules: (customEquivalentDomains: CustomEquivalentDomain[], excludedGlobalEquivalentDomains: number[]) => Promise<void>;
   onRenameAuthorizedDevice: (device: AuthorizedDevice, name: string) => Promise<void>;
   onRevokeDeviceTrust: (device: AuthorizedDevice) => void;
+  onTrustDevicePermanently: (device: AuthorizedDevice) => void;
   onRemoveDevice: (device: AuthorizedDevice) => void;
   onRevokeAllDeviceTrust: () => void;
   onRemoveAllDevices: () => void;
@@ -119,6 +129,10 @@ export interface AppMainRoutesProps {
   onToggleUserStatus: (userId: string, status: 'active' | 'banned') => Promise<void>;
   onDeleteUser: (userId: string) => Promise<void>;
   onRevokeInvite: (code: string) => Promise<void>;
+  onLoadAuditLogs: (filters: AuditLogFilters) => Promise<AuditLogListResult>;
+  onLoadAuditLogSettings: () => Promise<AuditLogSettings>;
+  onSaveAuditLogSettings: (settings: AuditLogSettings) => Promise<AuditLogSettings>;
+  onClearAuditLogs: () => Promise<number>;
   onExportBackup: (includeAttachments?: boolean) => Promise<void>;
   onImportBackup: (file: File, replaceExisting?: boolean) => Promise<AdminBackupImportResponse>;
   onImportBackupAllowingChecksumMismatch: (file: File, replaceExisting?: boolean) => Promise<AdminBackupImportResponse>;
@@ -201,6 +215,7 @@ export default function AppMainRoutes(props: AppMainRoutesProps) {
             onDelete={props.onDeleteVaultItem}
             onArchive={props.onArchiveVaultItem}
             onUnarchive={props.onUnarchiveVaultItem}
+            onRestore={props.onRestoreVaultItems}
             onBulkDelete={props.onBulkDeleteVaultItems}
             onBulkPermanentDelete={props.onBulkPermanentDeleteVaultItems}
             onBulkRestore={props.onBulkRestoreVaultItems}
@@ -268,6 +283,10 @@ export default function AppMainRoutes(props: AppMainRoutesProps) {
                 <Shield size={18} />
                 <span>{t('nav_device_management')}</span>
               </Link>
+              <Link href="/settings/domain-rules" className="mobile-settings-link">
+                <Globe2 size={18} />
+                <span>{t('nav_domain_rules')}</span>
+              </Link>
               <Link href={props.importRoute} className="mobile-settings-link">
                 <ArrowUpDown size={18} />
                 <span>{t('nav_import_export')}</span>
@@ -276,6 +295,12 @@ export default function AppMainRoutes(props: AppMainRoutesProps) {
                 <Link href="/admin" className="mobile-settings-link">
                   <ShieldUser size={18} />
                   <span>{t('nav_admin_panel')}</span>
+                </Link>
+              )}
+              {isAdmin && (
+                <Link href="/logs" className="mobile-settings-link">
+                  <FileClock size={18} />
+                  <span>{t('nav_log_center')}</span>
                 </Link>
               )}
               {isAdmin && (
@@ -312,9 +337,32 @@ export default function AppMainRoutes(props: AppMainRoutesProps) {
               onRefresh={() => void props.onRefreshAuthorizedDevices()}
               onRenameDevice={props.onRenameAuthorizedDevice}
               onRevokeTrust={props.onRevokeDeviceTrust}
+              onTrustPermanently={props.onTrustDevicePermanently}
               onRemoveDevice={props.onRemoveDevice}
               onRevokeAll={props.onRevokeAllDeviceTrust}
               onRemoveAll={props.onRemoveAllDevices}
+            />
+          </Suspense>
+        </div>
+      </Route>
+      <Route path="/settings/domain-rules">
+        <div className="stack domain-rules-route">
+          {props.mobileLayout && (
+            <div className="mobile-settings-subhead">
+              <button type="button" className="btn btn-secondary small mobile-settings-back" onClick={() => props.onNavigate(props.settingsHomeRoute)}>
+                <span className="btn-icon" aria-hidden="true">{"<"}</span>
+                {t('txt_back')}
+              </button>
+            </div>
+          )}
+          <Suspense fallback={<RouteContentFallback />}>
+            <DomainRulesPage
+              rules={props.domainRules}
+              loading={props.domainRulesLoading}
+              error={props.domainRulesError}
+              onRefresh={props.onRefreshDomainRules}
+              onSave={props.onSaveDomainRules}
+              onNotify={props.onNotify}
             />
           </Suspense>
         </div>
@@ -345,6 +393,23 @@ export default function AppMainRoutes(props: AppMainRoutesProps) {
             />
           </Suspense>
         </div>
+      </Route>
+      <Route path="/logs">
+        {isAdmin ? (
+          <div className="stack">
+            <Suspense fallback={<RouteContentFallback />}>
+              <LogCenterPage
+                onLoadLogs={props.onLoadAuditLogs}
+                onLoadSettings={props.onLoadAuditLogSettings}
+                onSaveSettings={props.onSaveAuditLogSettings}
+                onClearLogs={props.onClearAuditLogs}
+                onNotify={props.onNotify}
+                mobileLayout={props.mobileLayout}
+                onMobileBack={() => props.onNavigate(props.settingsHomeRoute)}
+              />
+            </Suspense>
+          </div>
+        ) : null}
       </Route>
       {importRoutePaths.map((path) => (
         <Route key={path} path={path}>
